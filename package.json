@@ -1,0 +1,10 @@
+{
+  "name": "websearch-image-understanding",
+  "version": "1.0.0",
+  "description": "Web search and image understanding via MiniMax Token Plan APIs",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extension"],
+    "skills": ["."]
+  }
+}
