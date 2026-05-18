@@ -10,10 +10,11 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as https from "https";
+import { URL } from "url";
 
 interface MinimaxCredentials {
   apiKey: string;
@@ -117,6 +118,49 @@ function saveCredentials(apiKey: string, apiHost?: string): void {
   fs.writeFileSync(credsPath, `MINIMAX_API_KEY="${apiKey}"${hostLine}\n`);
 }
 
+/**
+ * Make an HTTPS POST request with JSON body
+ */
+function httpsRequest<T = Record<string, unknown>>(url: string, body: Record<string, unknown>, apiKey: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const data = JSON.stringify(body);
+    
+    const options = {
+      hostname: urlObj.hostname,
+      port: 443,
+      path: urlObj.pathname,
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(data),
+      },
+    };
+    
+    const req = https.request(options, (res) => {
+      let body = "";
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(body) as T);
+        } catch {
+          reject(new Error(`Failed to parse response: ${body}`));
+        }
+      });
+    });
+    
+    req.on("error", reject);
+    req.setTimeout(30000, () => {
+      req.destroy();
+      reject(new Error("Request timeout"));
+    });
+    
+    req.write(data);
+    req.end();
+  });
+}
+
 export default function (pi: ExtensionAPI) {
   // ── Command: /set-minimax-key ─────────────────────────────────────────────
   
@@ -214,20 +258,12 @@ export default function (pi: ExtensionAPI) {
       try {
         onUpdate?.({ content: [{ type: "text", text: "Searching web..." }] });
         
-        // Use curl to call the API directly
-        const searchUrl = `${creds.apiHost}/v1/coding_plan/search`;
-        const body = JSON.stringify({ q: params.query });
-        
-        const curlCmd = [
-          "curl", "-s", "-X", "POST", searchUrl,
-          "-H", `Authorization: Bearer ${creds.apiKey}`,
-          "-H", "Content-Type: application/json",
-          "-d", body,
-          "--max-time", "30"
-        ];
-        
-        const result = execSync(curlCmd.join(" "), { encoding: "utf-8" });
-        const data = JSON.parse(result);
+        // Use Node's https module for reliable API call
+        const data = await httpsRequest(
+          `${creds.apiHost}/v1/coding_plan/search`,
+          { q: params.query },
+          creds.apiKey
+        );
         
         // Format results
         const organic = data.organic || [];
@@ -319,19 +355,11 @@ export default function (pi: ExtensionAPI) {
         }
         
         // Call VLM API
-        const vlmUrl = `${creds.apiHost}/v1/coding_plan/vlm`;
-        const body = JSON.stringify({ prompt: params.prompt, image_url: imageUrl });
-        
-        const curlCmd = [
-          "curl", "-s", "-X", "POST", vlmUrl,
-          "-H", `Authorization: Bearer ${creds.apiKey}`,
-          "-H", "Content-Type: application/json",
-          "-d", body,
-          "--max-time", "60"
-        ];
-        
-        const result = execSync(curlCmd.join(" "), { encoding: "utf-8" });
-        const data = JSON.parse(result);
+        const data = await httpsRequest(
+          `${creds.apiHost}/v1/coding_plan/vlm`,
+          { prompt: params.prompt, image_url: imageUrl },
+          creds.apiKey
+        );
         
         if (data.base_resp?.status_code !== 0) {
           return {
