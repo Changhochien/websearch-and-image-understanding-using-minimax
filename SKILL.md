@@ -1,16 +1,18 @@
 ---
 name: websearch-image-understanding
-description: Web search and image understanding via MiniMax Token Plan APIs. Use when asked to "search the web", "look up", "find information online", "analyze an image", "describe this image", or "understand what's in this picture".
+description: Web search, page fetching, and image understanding via MiniMax Token Plan APIs. Use when asked to "search the web", "look up", "find information online", "fetch a URL", "read a web page", "analyze an image", "describe this image", or "understand what's in this picture".
 ---
 
 # websearch-image-understanding
 
-Token-efficient web search and image understanding via MiniMax Token Plan APIs.
+Token-efficient web search, page fetching, and image understanding via MiniMax Token Plan APIs.
 
 **Features:**
 - Uses pi's built-in MiniMax authentication automatically (no setup required)
 - Supports custom API key configuration via `/set-minimax-key` command
-- Provides `minimax_search` and `image_understanding` tools
+- Provides `minimax_search`, `minimax_fetch`, and `image_understanding` tools
+- SSRF protection — blocks requests to private/loopback addresses
+- Large responses are truncated and spilled to temp files for later reading
 
 ---
 
@@ -80,6 +82,27 @@ image_understanding({
   prompt: "Describe the UI elements"
 })
 ```
+
+### `minimax_fetch`
+
+Fetch and read content from any web page URL. Returns cleaned plain text (or raw HTML with `raw: true`).
+
+```
+minimax_fetch({
+  url: "https://docs.python.org/3/whatsnew/3.13.html"
+})
+
+minimax_fetch({
+  url: "https://example.com/api-docs",
+  raw: true
+})
+```
+
+**Features:**
+- Strips HTML to readable text by default
+- Extracts page title automatically
+- Blocks private/loopback addresses (SSRF protection)
+- Large pages (>500 lines or >80KB) are truncated with full content saved to a temp file
 
 ---
 

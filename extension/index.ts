@@ -1,11 +1,13 @@
 /**
- * MiniMax Web Search & Image Understanding Extension for pi
+ * MiniMax Web Search, Web Fetch & Image Understanding Extension for pi
  * 
  * Features:
  * - Uses pi's internal MiniMax API key by default (ANTHROPIC_AUTH_TOKEN)
  * - Provides /set-minimax-key command to configure custom API key
  * - Stores user-configured key in ~/.config/minimax-support/creds.toml
- * - Registers search and understand tools
+ * - Registers search, fetch, and image understanding tools
+ * - SSRF guard prevents access to private/loopback addresses
+ * - Large response spillover to temp file with truncation
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -161,6 +163,110 @@ function httpsRequest<T = Record<string, unknown>>(url: string, body: Record<str
   });
 }
 
+// ─── Web Fetch helpers ──────────────────────────────────────────────────────
+
+const SUPPORTED_PROTOCOLS = new Set(["http:", "https:"]);
+const SKIP_CONTENT_TYPES = new Set([
+  "image/", "video/", "audio/", "application/octet-stream",
+]);
+const MAX_FETCH_LINES = 500;
+const MAX_FETCH_BYTES = 80_000;
+
+interface FetchTruncation {
+  totalLines: number;
+  outputLines: number;
+  totalBytes: number;
+  outputBytes: number;
+}
+
+function isPrivateOrLoopbackHostname(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h.endsWith(".localhost")) return true;
+  if (h === "::1" || h === "::" || h.startsWith("fe80:") || h.startsWith("fc") || h.startsWith("fd")) return true;
+  const v4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!v4) return false;
+  const [a, b] = [Number(v4[1]), Number(v4[2])];
+  if (a === 0 || a === 127 || a === 10) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  return false;
+}
+
+function validateUrl(raw: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`Invalid URL: ${raw}`);
+  }
+  if (!SUPPORTED_PROTOCOLS.has(parsed.protocol)) {
+    throw new Error(
+      `Unsupported protocol: ${parsed.protocol}. Only http and https are allowed.`,
+    );
+  }
+  if (isPrivateOrLoopbackHostname(parsed.hostname)) {
+    throw new Error(
+      `Refusing to fetch private/loopback address: ${parsed.hostname}`,
+    );
+  }
+  return parsed;
+}
+
+function htmlToText(html: string): string {
+  // Aggressive strip-to-text: remove scripts, styles, tags, decode entities
+  return html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function extractTitle(html: string): string | undefined {
+  const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (!match) return undefined;
+  return match[1].replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ").trim();
+}
+
+function truncateText(
+  text: string,
+): { text: string; truncation?: FetchTruncation } {
+  const lines = text.split("\n");
+  const totalLines = lines.length;
+  const totalBytes = Buffer.byteLength(text, "utf-8");
+
+  if (totalLines <= MAX_FETCH_LINES && totalBytes <= MAX_FETCH_BYTES) {
+    return { text };
+  }
+
+  let outputLines = 0;
+  let outputBytes = 0;
+  const truncated: string[] = [];
+  for (const line of lines) {
+    const lineBytes = Buffer.byteLength(line + "\n", "utf-8");
+    if (outputLines >= MAX_FETCH_LINES || outputBytes + lineBytes > MAX_FETCH_BYTES) {
+      break;
+    }
+    truncated.push(line);
+    outputLines++;
+    outputBytes += lineBytes;
+  }
+
+  return {
+    text: truncated.join("\n"),
+    truncation: { totalLines, outputLines, totalBytes, outputBytes },
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   // ── Command: /set-minimax-key ─────────────────────────────────────────────
   
@@ -299,6 +405,139 @@ export default function (pi: ExtensionAPI) {
     },
   });
   
+  // ── Tool: minimax_fetch ──────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "minimax_fetch",
+    label: "MiniMax Fetch",
+    description:
+      "Fetch and read content from a URL. Returns extracted text from web pages. Use to read documentation, articles, or any web content found via search.",
+    promptSnippet: "Fetch and read web page content",
+    promptGuidelines: [
+      "Use minimax_fetch to read the full content of a specific URL — documentation pages, blog posts, API references.",
+      "minimax_fetch complements minimax_search: search finds URLs, fetch reads them.",
+      'After answering using fetched content, include a "Sources:" section with a markdown hyperlink to the URL.',
+      "Large responses are truncated and spilled to a temp file — the file path is in the result details.",
+    ],
+    parameters: Type.Object({
+      url: Type.String({ description: "The URL to fetch. Must be http or https." }),
+      raw: Type.Optional(
+        Type.Boolean({
+          description:
+            "If true, return raw HTML. Default false: strip HTML to plain text.",
+          default: false,
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, signal, onUpdate, _ctx) {
+      try {
+        const targetUrl = validateUrl(params.url);
+        const raw = params.raw ?? false;
+
+        onUpdate?.({
+          content: [{ type: "text", text: `Fetching: ${params.url}...` }],
+        });
+
+        const res = await fetch(targetUrl.toString(), {
+          method: "GET",
+          headers: {
+            Accept: "text/html, text/plain, */*",
+            "Accept-Encoding": "gzip",
+            "User-Agent": "pi-minimax-fetch/1.0",
+          },
+          signal,
+          redirect: "follow",
+        });
+
+        if (!res.ok) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to fetch ${params.url}: HTTP ${res.status} ${res.statusText}`,
+              },
+            ],
+            details: { url: params.url, status: res.status },
+            isError: true,
+          };
+        }
+
+        const contentType = res.headers.get("content-type") ?? "";
+        if (
+          SKIP_CONTENT_TYPES.has(contentType) ||
+          [...SKIP_CONTENT_TYPES].some((t) => contentType.startsWith(t))
+        ) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Cannot fetch ${params.url}: unsupported content type "${contentType}" (images, video, and audio are not supported).`,
+              },
+            ],
+            details: { url: params.url, contentType },
+            isError: true,
+          };
+        }
+
+        const body = await res.text();
+        const title = extractTitle(body);
+
+        // Process content: raw HTML or stripped text
+        const processed = raw ? body : htmlToText(body);
+
+        // Truncate large responses
+        const { text: displayText, truncation } = truncateText(processed);
+
+        const contentLength = res.headers.get("content-length");
+        const details: Record<string, unknown> = {
+          url: params.url,
+          title,
+          contentType: contentType || undefined,
+          contentLength: contentLength ? Number(contentLength) : undefined,
+        };
+
+        let finalContent = `**Fetched:** ${params.url}\n`;
+        if (title) finalContent += `**Title:** ${title}\n`;
+        if (contentType) finalContent += `**Content-Type:** ${contentType}\n`;
+        finalContent += `\n${displayText}`;
+
+        if (truncation) {
+          // Spill full content to temp file
+          const tmpDir = fs.mkdtempSync(
+            path.join(os.tmpdir(), "minimax-fetch-"),
+          );
+          const spillPath = path.join(tmpDir, "full-content.txt");
+          fs.writeFileSync(spillPath, processed, "utf-8");
+
+          const truncatedLines =
+            truncation.totalLines - truncation.outputLines;
+          const truncatedBytes =
+            truncation.totalBytes - truncation.outputBytes;
+          finalContent += `\n\n[Content truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines (${(truncation.outputBytes / 1000).toFixed(1)}KB of ${(truncation.totalBytes / 1000).toFixed(1)}KB). ${truncatedLines} lines (${(truncatedBytes / 1000).toFixed(1)}KB) omitted. Full content saved to: ${spillPath}]`;
+          details.truncation = {
+            totalLines: truncation.totalLines,
+            outputLines: truncation.outputLines,
+            totalBytes: truncation.totalBytes,
+            outputBytes: truncation.outputBytes,
+          };
+          details.fullOutputPath = spillPath;
+        }
+
+        return {
+          content: [{ type: "text", text: finalContent }],
+          details,
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text", text: `Fetch failed: ${message}` }],
+          details: { error: message, url: params.url },
+          isError: true,
+        };
+      }
+    },
+  });
+
   // ── Tool: image_understanding ───────────────────────────────────────────
   
   pi.registerTool({
