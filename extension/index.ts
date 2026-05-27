@@ -340,13 +340,14 @@ export default function (pi: ExtensionAPI) {
     },
   });
   
-  // ── Tool: minimax_search ──────────────────────────────────────────────────
+  // ── Tool: web_search ───────────────────────────────────────────────────
   
   pi.registerTool({
-    name: "minimax_search",
-    label: "MiniMax Search",
-    description: "Search the web using MiniMax Token Plan API. Use for real-time web search, looking up information, or finding online resources.",
-    promptSnippet: "MiniMax web search for current information",
+    name: "web_search",
+    label: "Web Search",
+    description:
+      "Search the web for up-to-date information. Returns a list of results with titles, URLs, and snippets. Use when you need current information not in your training data.",
+    promptSnippet: "Web search for current information",
     parameters: Type.Object({
       query: Type.String({ description: "The search query" }),
       related: Type.Optional(Type.Boolean({ description: "Include related searches" })),
@@ -405,17 +406,17 @@ export default function (pi: ExtensionAPI) {
     },
   });
   
-  // ── Tool: minimax_fetch ──────────────────────────────────────────────────
+  // ── Tool: web_fetch ────────────────────────────────────────────────────
 
   pi.registerTool({
-    name: "minimax_fetch",
-    label: "MiniMax Fetch",
+    name: "web_fetch",
+    label: "Web Fetch",
     description:
       "Fetch and read content from a URL. Returns extracted text from web pages. Use to read documentation, articles, or any web content found via search.",
     promptSnippet: "Fetch and read web page content",
     promptGuidelines: [
-      "Use minimax_fetch to read the full content of a specific URL — documentation pages, blog posts, API references.",
-      "minimax_fetch complements minimax_search: search finds URLs, fetch reads them.",
+      "Use web_fetch to read the full content of a specific URL — documentation pages, blog posts, API references found via web_search.",
+      "web_fetch complements web_search: search finds URLs, fetch reads them.",
       'After answering using fetched content, include a "Sources:" section with a markdown hyperlink to the URL.',
       "Large responses are truncated and spilled to a temp file — the file path is in the result details.",
     ],

@@ -10,7 +10,7 @@ Token-efficient web search, page fetching, and image understanding via MiniMax T
 **Features:**
 - Uses pi's built-in MiniMax authentication automatically (no setup required)
 - Supports custom API key configuration via `/set-minimax-key` command
-- Provides `minimax_search`, `minimax_fetch`, and `image_understanding` tools
+- Provides `web_search`, `web_fetch`, and `image_understanding` tools
 - SSRF protection — blocks requests to private/loopback addresses
 - Large responses are truncated and spilled to temp files for later reading
 
@@ -56,12 +56,12 @@ Clear your custom key and revert to pi's built-in key.
 
 ## Tools
 
-### `minimax_search`
+### `web_search`
 
 Search the web for real-time information.
 
 ```
-minimax_search({
+web_search({
   query: "Python 3.13 release date",
   related: true  // optional: include related searches
 })
@@ -83,16 +83,16 @@ image_understanding({
 })
 ```
 
-### `minimax_fetch`
+### `web_fetch`
 
 Fetch and read content from any web page URL. Returns cleaned plain text (or raw HTML with `raw: true`).
 
 ```
-minimax_fetch({
+web_fetch({
   url: "https://docs.python.org/3/whatsnew/3.13.html"
 })
 
-minimax_fetch({
+web_fetch({
   url: "https://example.com/api-docs",
   raw: true
 })
