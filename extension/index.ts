@@ -7,7 +7,9 @@
  * - Stores user-configured key in ~/.config/minimax-support/creds.toml
  * - Registers search, fetch, and image understanding tools
  * - SSRF guard prevents access to private/loopback addresses
- * - Large response spillover to temp file with truncation
+ * - Smart content negotiation: HEAD, sniff, sibling .md detection
+ * - HTML → Markdown via Readability + Turndown + GFM
+ * - Output modes: auto (inline ≤15K chars), inline, file
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -17,18 +19,26 @@ import * as path from "path";
 import * as os from "os";
 import * as https from "https";
 import { URL } from "url";
+import {
+  FetchError,
+  fetchWithNegotiation,
+  validateUrl,
+  htmlToMarkdown,
+  wrapAsCodeBlock,
+  writeTempFile,
+} from "./fetch";
 
 interface MinimaxCredentials {
   apiKey: string;
   apiHost: string;
 }
 
-// Path to pi's auth.json
+// ─── Credentials Management ───────────────────────────────────────────────────
+
 function getPiAuthPath(): string {
   return path.join(os.homedir(), ".pi", "agent", "auth.json");
 }
 
-// Path to store user-configured credentials
 function getCredsPath(): string {
   return path.join(os.homedir(), ".config", "minimax-support", "creds.toml");
 }
@@ -40,14 +50,7 @@ interface PiAuth {
   };
 }
 
-/**
- * Load credentials with priority:
- * 1. User-configured key in creds.toml
- * 2. Pi's built-in minimax authentication
- * 3. Pi's built-in minimax-cn (China) authentication
- */
 function loadCredentials(): MinimaxCredentials | null {
-  // First, check for user-configured key
   const credsPath = getCredsPath();
   if (fs.existsSync(credsPath)) {
     try {
@@ -75,26 +78,16 @@ function loadCredentials(): MinimaxCredentials | null {
     }
   }
   
-  // Fall back to pi's built-in minimax authentication
   const piAuthPath = getPiAuthPath();
   if (fs.existsSync(piAuthPath)) {
     try {
       const authData: PiAuth = JSON.parse(fs.readFileSync(piAuthPath, "utf-8"));
       
-      // Try minimax (global)
       if (authData.minimax?.key) {
-        return {
-          apiKey: authData.minimax.key,
-          apiHost: "https://api.minimax.io",
-        };
+        return { apiKey: authData.minimax.key, apiHost: "https://api.minimax.io" };
       }
-      
-      // Try minimax-cn (China)
       if (authData["minimax-cn"]?.key) {
-        return {
-          apiKey: authData["minimax-cn"].key,
-          apiHost: "https://api.minimaxi.com",
-        };
+        return { apiKey: authData["minimax-cn"].key, apiHost: "https://api.minimaxi.com" };
       }
     } catch {
       // Ignore parse errors
@@ -104,14 +97,10 @@ function loadCredentials(): MinimaxCredentials | null {
   return null;
 }
 
-/**
- * Save user-configured credentials
- */
 function saveCredentials(apiKey: string, apiHost?: string): void {
   const configDir = path.join(os.homedir(), ".config", "minimax-support");
   const credsPath = path.join(configDir, "creds.toml");
   
-  // Create directory if needed
   if (!fs.existsSync(configDir)) {
     fs.mkdirSync(configDir, { recursive: true });
   }
@@ -120,9 +109,6 @@ function saveCredentials(apiKey: string, apiHost?: string): void {
   fs.writeFileSync(credsPath, `MINIMAX_API_KEY="${apiKey}"${hostLine}\n`);
 }
 
-/**
- * Make an HTTPS POST request with JSON body
- */
 function httpsRequest<T = Record<string, unknown>>(url: string, body: Record<string, unknown>, apiKey: string): Promise<T> {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
@@ -163,111 +149,18 @@ function httpsRequest<T = Record<string, unknown>>(url: string, body: Record<str
   });
 }
 
-// ─── Web Fetch helpers ──────────────────────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 
+const INLINE_MAX_CHARS = 15_000;
 const SUPPORTED_PROTOCOLS = new Set(["http:", "https:"]);
 const SKIP_CONTENT_TYPES = new Set([
   "image/", "video/", "audio/", "application/octet-stream",
 ]);
-const MAX_FETCH_LINES = 500;
-const MAX_FETCH_BYTES = 80_000;
 
-interface FetchTruncation {
-  totalLines: number;
-  outputLines: number;
-  totalBytes: number;
-  outputBytes: number;
-}
-
-function isPrivateOrLoopbackHostname(hostname: string): boolean {
-  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (h === "localhost" || h.endsWith(".localhost")) return true;
-  if (h === "::1" || h === "::" || h.startsWith("fe80:") || h.startsWith("fc") || h.startsWith("fd")) return true;
-  const v4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (!v4) return false;
-  const [a, b] = [Number(v4[1]), Number(v4[2])];
-  if (a === 0 || a === 127 || a === 10) return true;
-  if (a === 169 && b === 254) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 192 && b === 168) return true;
-  return false;
-}
-
-function validateUrl(raw: string): URL {
-  let parsed: URL;
-  try {
-    parsed = new URL(raw);
-  } catch {
-    throw new Error(`Invalid URL: ${raw}`);
-  }
-  if (!SUPPORTED_PROTOCOLS.has(parsed.protocol)) {
-    throw new Error(
-      `Unsupported protocol: ${parsed.protocol}. Only http and https are allowed.`,
-    );
-  }
-  if (isPrivateOrLoopbackHostname(parsed.hostname)) {
-    throw new Error(
-      `Refusing to fetch private/loopback address: ${parsed.hostname}`,
-    );
-  }
-  return parsed;
-}
-
-function htmlToText(html: string): string {
-  // Aggressive strip-to-text: remove scripts, styles, tags, decode entities
-  return html
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-    .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, "")
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-function extractTitle(html: string): string | undefined {
-  const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  if (!match) return undefined;
-  return match[1].replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ").trim();
-}
-
-function truncateText(
-  text: string,
-): { text: string; truncation?: FetchTruncation } {
-  const lines = text.split("\n");
-  const totalLines = lines.length;
-  const totalBytes = Buffer.byteLength(text, "utf-8");
-
-  if (totalLines <= MAX_FETCH_LINES && totalBytes <= MAX_FETCH_BYTES) {
-    return { text };
-  }
-
-  let outputLines = 0;
-  let outputBytes = 0;
-  const truncated: string[] = [];
-  for (const line of lines) {
-    const lineBytes = Buffer.byteLength(line + "\n", "utf-8");
-    if (outputLines >= MAX_FETCH_LINES || outputBytes + lineBytes > MAX_FETCH_BYTES) {
-      break;
-    }
-    truncated.push(line);
-    outputLines++;
-    outputBytes += lineBytes;
-  }
-
-  return {
-    text: truncated.join("\n"),
-    truncation: { totalLines, outputLines, totalBytes, outputBytes },
-  };
-}
+// ─── Extension Registration ───────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  
   // ── Command: /set-minimax-key ─────────────────────────────────────────────
   
   pi.registerCommand("set-minimax-key", {
@@ -286,7 +179,6 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       
-      // Determine host based on region
       let apiHost = "https://api.minimax.io";
       if (region === "cn") {
         apiHost = "https://api.minimaxi.com";
@@ -305,11 +197,8 @@ export default function (pi: ExtensionAPI) {
       const creds = loadCredentials();
       
       if (creds) {
-        // Check if using internal or user key
         const isInternal = process.env.ANTHROPIC_AUTH_TOKEN === creds.apiKey;
         const source = isInternal ? "pi internal key" : "user-configured";
-        
-        // Mask the key for display
         const maskedKey = creds.apiKey.slice(0, 8) + "..." + creds.apiKey.slice(-4);
         
         ctx.ui.notify(
@@ -325,7 +214,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
   
-  // ── Command: /minimax-clear-key ───────────────────────────────────────────
+  // ── Command: /minimax-clear-key ──────────────────────────────────────────
   
   pi.registerCommand("minimax-clear-key", {
     description: "Clear user-configured key and use pi internal key",
@@ -340,7 +229,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
   
-  // ── Tool: web_search ───────────────────────────────────────────────────
+  // ── Tool: web_search ─────────────────────────────────────────────────────
   
   pi.registerTool({
     name: "web_search",
@@ -365,14 +254,15 @@ export default function (pi: ExtensionAPI) {
       try {
         onUpdate?.({ content: [{ type: "text", text: "Searching web..." }] });
         
-        // Use Node's https module for reliable API call
-        const data = await httpsRequest(
+        const data = await httpsRequest<{
+          organic?: Array<{ title: string; link: string; snippet?: string }>;
+          related_searches?: Array<{ query: string }>;
+        }>(
           `${creds.apiHost}/v1/coding_plan/search`,
           { q: params.query },
           creds.apiKey
         );
         
-        // Format results
         const organic = data.organic || [];
         if (organic.length === 0) {
           return {
@@ -387,8 +277,8 @@ export default function (pi: ExtensionAPI) {
           response += `${i + 1}. ${item.title}\n   ${item.link}\n   ${item.snippet || ""}\n\n`;
         }
         
-        if (params.related && data.related_searches?.length > 0) {
-          response += "Related: " + data.related_searches.map((r: { query: string }) => r.query).join(", ");
+        if (params.related && data.related_searches && data.related_searches.length > 0) {
+          response += "Related: " + data.related_searches.map((r) => r.query).join(", ");
         }
         
         return {
@@ -406,126 +296,114 @@ export default function (pi: ExtensionAPI) {
     },
   });
   
-  // ── Tool: web_fetch ────────────────────────────────────────────────────
+  // ── Tool: web_fetch ──────────────────────────────────────────────────────
 
   pi.registerTool({
     name: "web_fetch",
     label: "Web Fetch",
     description:
-      "Fetch and read content from a URL. Returns extracted text from web pages. Use to read documentation, articles, or any web content found via search.",
+      "Fetch and read content from a URL. Automatically converts HTML to clean Markdown using Readability + Turndown with GitHub Flavored Markdown support. Smart content negotiation detects Markdown files, raw text, and HTML pages.",
     promptSnippet: "Fetch and read web page content",
     promptGuidelines: [
       "Use web_fetch to read the full content of a specific URL — documentation pages, blog posts, API references found via web_search.",
       "web_fetch complements web_search: search finds URLs, fetch reads them.",
       'After answering using fetched content, include a "Sources:" section with a markdown hyperlink to the URL.',
-      "Large responses are truncated and spilled to a temp file — the file path is in the result details.",
+      "Large responses (>15K chars) are automatically saved to a temp file. Use the 'read' tool to access the full content.",
+      "The tool automatically detects Markdown files, raw text, and HTML pages using content negotiation.",
     ],
     parameters: Type.Object({
       url: Type.String({ description: "The URL to fetch. Must be http or https." }),
+      output_mode: Type.Optional(
+        Type.Union(
+          [Type.Literal("auto"), Type.Literal("inline"), Type.Literal("file")],
+          { description: "Output mode: auto (inline ≤15K chars, else file), inline (always return content), file (always write to temp file)", default: "auto" }
+        )
+      ),
+      abs_links: Type.Optional(
+        Type.Boolean({
+          description: "Absolutize relative links and images in Markdown (default: true)",
+          default: true
+        })
+      ),
+      timeout_ms: Type.Optional(
+        Type.Number({
+          description: "Fetch timeout in milliseconds (default: 30000)",
+          default: 30000
+        })
+      ),
       raw: Type.Optional(
         Type.Boolean({
-          description:
-            "If true, return raw HTML. Default false: strip HTML to plain text.",
-          default: false,
-        }),
+          description: "DEPRECATED: Use output_mode='file' instead. If true, return raw content instead of Markdown.",
+          default: false
+        })
       ),
     }),
-    async execute(_toolCallId, params, signal, onUpdate, _ctx) {
+    async execute(_toolCallId, params, _signal, onUpdate, _ctx) {
       try {
+        // Validate URL first
         const targetUrl = validateUrl(params.url);
+        
+        // Get options
         const raw = params.raw ?? false;
+        const outputMode = (params.output_mode as "auto" | "inline" | "file" | undefined) ?? "auto";
+        const absLinks = (params.abs_links as boolean | undefined) ?? true;
+        const timeoutMs = typeof params.timeout_ms === "number" ? params.timeout_ms : 30000;
 
-        onUpdate?.({
-          content: [{ type: "text", text: `Fetching: ${params.url}...` }],
-        });
+        // Handle deprecated raw parameter
+        const finalOutputMode = raw ? "file" : outputMode;
 
-        const res = await fetch(targetUrl.toString(), {
-          method: "GET",
-          headers: {
-            Accept: "text/html, text/plain, */*",
-            "Accept-Encoding": "gzip",
-            "User-Agent": "pi-minimax-fetch/1.0",
-          },
-          signal,
-          redirect: "follow",
-        });
+        onUpdate?.({ content: [{ type: "text", text: `Fetching: ${params.url}...` }] });
 
-        if (!res.ok) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Failed to fetch ${params.url}: HTTP ${res.status} ${res.statusText}`,
-              },
-            ],
-            details: { url: params.url, status: res.status },
-            isError: true,
-          };
+        // Use smart content negotiation
+        const result = await fetchWithNegotiation(targetUrl.toString(), { timeoutMs });
+
+        // Resolve content to Markdown
+        let markdown: string;
+        if (result.isMarkdown) {
+          markdown = result.text;
+        } else if (result.isPlainText) {
+          markdown = wrapAsCodeBlock(result.text, result.url);
+        } else {
+          markdown = await htmlToMarkdown(result.text, result.url, { absLinks });
         }
 
-        const contentType = res.headers.get("content-type") ?? "";
-        if (
-          SKIP_CONTENT_TYPES.has(contentType) ||
-          [...SKIP_CONTENT_TYPES].some((t) => contentType.startsWith(t))
-        ) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Cannot fetch ${params.url}: unsupported content type "${contentType}" (images, video, and audio are not supported).`,
-              },
-            ],
-            details: { url: params.url, contentType },
-            isError: true,
-          };
-        }
+        const lines = markdown.split("\n").length;
+        const chars = markdown.length;
 
-        const body = await res.text();
-        const title = extractTitle(body);
+        // Determine output mode
+        const useFile = finalOutputMode === "file" || 
+                       (finalOutputMode === "auto" && chars > INLINE_MAX_CHARS);
 
-        // Process content: raw HTML or stripped text
-        const processed = raw ? body : htmlToText(body);
-
-        // Truncate large responses
-        const { text: displayText, truncation } = truncateText(processed);
-
-        const contentLength = res.headers.get("content-length");
         const details: Record<string, unknown> = {
-          url: params.url,
-          title,
-          contentType: contentType || undefined,
-          contentLength: contentLength ? Number(contentLength) : undefined,
+          url: result.url,
+          contentType: result.contentType,
+          isMarkdown: result.isMarkdown,
+          isPlainText: result.isPlainText,
         };
 
-        let finalContent = `**Fetched:** ${params.url}\n`;
-        if (title) finalContent += `**Title:** ${title}\n`;
-        if (contentType) finalContent += `**Content-Type:** ${contentType}\n`;
-        finalContent += `\n${displayText}`;
-
-        if (truncation) {
-          // Spill full content to temp file
-          const tmpDir = fs.mkdtempSync(
-            path.join(os.tmpdir(), "minimax-fetch-"),
-          );
-          const spillPath = path.join(tmpDir, "full-content.txt");
-          fs.writeFileSync(spillPath, processed, "utf-8");
-
-          const truncatedLines =
-            truncation.totalLines - truncation.outputLines;
-          const truncatedBytes =
-            truncation.totalBytes - truncation.outputBytes;
-          finalContent += `\n\n[Content truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines (${(truncation.outputBytes / 1000).toFixed(1)}KB of ${(truncation.totalBytes / 1000).toFixed(1)}KB). ${truncatedLines} lines (${(truncatedBytes / 1000).toFixed(1)}KB) omitted. Full content saved to: ${spillPath}]`;
-          details.truncation = {
-            totalLines: truncation.totalLines,
-            outputLines: truncation.outputLines,
-            totalBytes: truncation.totalBytes,
-            outputBytes: truncation.outputBytes,
+        if (useFile) {
+          const filePath = writeTempFile(markdown, "minimax-fetch", ".md");
+          details.filePath = filePath;
+          details.chars = chars;
+          details.lines = lines;
+          
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Content written to ${filePath} (${chars.toLocaleString()} chars, ${lines.toLocaleString()} lines). Use the read tool to access it.`,
+              },
+            ],
+            details,
           };
-          details.fullOutputPath = spillPath;
         }
 
+        // Inline output
+        details.chars = chars;
+        details.lines = lines;
+
         return {
-          content: [{ type: "text", text: finalContent }],
+          content: [{ type: "text", text: markdown }],
           details,
         };
       } catch (error) {
@@ -563,7 +441,6 @@ export default function (pi: ExtensionAPI) {
       try {
         onUpdate?.({ content: [{ type: "text", text: "Analyzing image..." }] });
         
-        // Process image - handle URLs, local files, or data
         let imageUrl = params.image;
         
         // Handle @ prefix (MCP convention)
@@ -583,7 +460,6 @@ export default function (pi: ExtensionAPI) {
             };
           }
           
-          // Convert to base64 data URL
           const imageBuffer = fs.readFileSync(imagePath);
           const ext = path.extname(imagePath).toLowerCase();
           let mimeType = "image/jpeg";
@@ -594,8 +470,10 @@ export default function (pi: ExtensionAPI) {
           imageUrl = `data:${mimeType};base64,${base64}`;
         }
         
-        // Call VLM API
-        const data = await httpsRequest(
+        const data = await httpsRequest<{
+          base_resp?: { status_code: number; status_msg?: string };
+          content?: string;
+        }>(
           `${creds.apiHost}/v1/coding_plan/vlm`,
           { prompt: params.prompt, image_url: imageUrl },
           creds.apiKey
