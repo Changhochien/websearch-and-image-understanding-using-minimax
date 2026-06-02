@@ -1,15 +1,18 @@
 /**
- * MiniMax Web Search, Web Fetch & Image Understanding Extension for pi
- * 
- * Features:
- * - Uses pi's internal MiniMax API key by default (ANTHROPIC_AUTH_TOKEN)
- * - Provides /set-minimax-key command to configure custom API key
- * - Stores user-configured key in ~/.config/minimax-support/creds.toml
- * - Registers search, fetch, and image understanding tools
- * - SSRF guard prevents access to private/loopback addresses
- * - Smart content negotiation: HEAD, sniff, sibling .md detection
- * - HTML → Markdown via Readability + Turndown + GFM
- * - Output modes: auto (inline ≤15K chars), inline, file
+ * MiniMax Web Search & Image Understanding Extension for pi
+ *
+ * Registers two tools that route through the MiniMax Token Plan API:
+ *   - web_search       — search the web for current information
+ *   - image_understanding — analyze an image (URL, local file, or base64)
+ *
+ * Authentication: uses pi's built-in MiniMax key by default, or a user-supplied
+ * key configured via /set-minimax-key. Keys are loaded with this priority:
+ *   1. ~/.config/minimax-support/creds.toml  (user-configured, /set-minimax-key)
+ *   2. ~/.pi/agent/auth.json                 (pi built-in MiniMax / MiniMax-CN)
+ *
+ * For web_fetch / batch_web_fetch (browser-fingerprinted HTTP + Defuddle
+ * extraction + batching), install the separate `pi-smart-fetch` package:
+ *   pi install npm:pi-smart-fetch
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -19,14 +22,6 @@ import * as path from "path";
 import * as os from "os";
 import * as https from "https";
 import { URL } from "url";
-import {
-  FetchError,
-  fetchWithNegotiation,
-  validateUrl,
-  htmlToMarkdown,
-  wrapAsCodeBlock,
-  writeTempFile,
-} from "./fetch";
 
 interface MinimaxCredentials {
   apiKey: string;
@@ -148,14 +143,6 @@ function httpsRequest<T = Record<string, unknown>>(url: string, body: Record<str
     req.end();
   });
 }
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const INLINE_MAX_CHARS = 15_000;
-const SUPPORTED_PROTOCOLS = new Set(["http:", "https:"]);
-const SKIP_CONTENT_TYPES = new Set([
-  "image/", "video/", "audio/", "application/octet-stream",
-]);
 
 // ─── Extension Registration ───────────────────────────────────────────────────
 
@@ -296,127 +283,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
   
-  // ── Tool: web_fetch ──────────────────────────────────────────────────────
-
-  pi.registerTool({
-    name: "web_fetch",
-    label: "Web Fetch",
-    description:
-      "Fetch and read content from a URL. Automatically converts HTML to clean Markdown using Readability + Turndown with GitHub Flavored Markdown support. Smart content negotiation detects Markdown files, raw text, and HTML pages.",
-    promptSnippet: "Fetch and read web page content",
-    promptGuidelines: [
-      "Use web_fetch to read the full content of a specific URL — documentation pages, blog posts, API references found via web_search.",
-      "web_fetch complements web_search: search finds URLs, fetch reads them.",
-      'After answering using fetched content, include a "Sources:" section with a markdown hyperlink to the URL.',
-      "Large responses (>15K chars) are automatically saved to a temp file. Use the 'read' tool to access the full content.",
-      "The tool automatically detects Markdown files, raw text, and HTML pages using content negotiation.",
-    ],
-    parameters: Type.Object({
-      url: Type.String({ description: "The URL to fetch. Must be http or https." }),
-      output_mode: Type.Optional(
-        Type.Union(
-          [Type.Literal("auto"), Type.Literal("inline"), Type.Literal("file")],
-          { description: "Output mode: auto (inline ≤15K chars, else file), inline (always return content), file (always write to temp file)", default: "auto" }
-        )
-      ),
-      abs_links: Type.Optional(
-        Type.Boolean({
-          description: "Absolutize relative links and images in Markdown (default: true)",
-          default: true
-        })
-      ),
-      timeout_ms: Type.Optional(
-        Type.Number({
-          description: "Fetch timeout in milliseconds (default: 30000)",
-          default: 30000
-        })
-      ),
-      raw: Type.Optional(
-        Type.Boolean({
-          description: "DEPRECATED: Use output_mode='file' instead. If true, return raw content instead of Markdown.",
-          default: false
-        })
-      ),
-    }),
-    async execute(_toolCallId, params, _signal, onUpdate, _ctx) {
-      try {
-        // Validate URL first
-        const targetUrl = validateUrl(params.url);
-        
-        // Get options
-        const raw = params.raw ?? false;
-        const outputMode = (params.output_mode as "auto" | "inline" | "file" | undefined) ?? "auto";
-        const absLinks = (params.abs_links as boolean | undefined) ?? true;
-        const timeoutMs = typeof params.timeout_ms === "number" ? params.timeout_ms : 30000;
-
-        // Handle deprecated raw parameter
-        const finalOutputMode = raw ? "file" : outputMode;
-
-        onUpdate?.({ content: [{ type: "text", text: `Fetching: ${params.url}...` }] });
-
-        // Use smart content negotiation
-        const result = await fetchWithNegotiation(targetUrl.toString(), { timeoutMs });
-
-        // Resolve content to Markdown
-        let markdown: string;
-        if (result.isMarkdown) {
-          markdown = result.text;
-        } else if (result.isPlainText) {
-          markdown = wrapAsCodeBlock(result.text, result.url);
-        } else {
-          markdown = await htmlToMarkdown(result.text, result.url, { absLinks });
-        }
-
-        const lines = markdown.split("\n").length;
-        const chars = markdown.length;
-
-        // Determine output mode
-        const useFile = finalOutputMode === "file" || 
-                       (finalOutputMode === "auto" && chars > INLINE_MAX_CHARS);
-
-        const details: Record<string, unknown> = {
-          url: result.url,
-          contentType: result.contentType,
-          isMarkdown: result.isMarkdown,
-          isPlainText: result.isPlainText,
-        };
-
-        if (useFile) {
-          const filePath = writeTempFile(markdown, "minimax-fetch", ".md");
-          details.filePath = filePath;
-          details.chars = chars;
-          details.lines = lines;
-          
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Content written to ${filePath} (${chars.toLocaleString()} chars, ${lines.toLocaleString()} lines). Use the read tool to access it.`,
-              },
-            ],
-            details,
-          };
-        }
-
-        // Inline output
-        details.chars = chars;
-        details.lines = lines;
-
-        return {
-          content: [{ type: "text", text: markdown }],
-          details,
-        };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: `Fetch failed: ${message}` }],
-          details: { error: message, url: params.url },
-          isError: true,
-        };
-      }
-    },
-  });
-
   // ── Tool: image_understanding ───────────────────────────────────────────
   
   pi.registerTool({

@@ -1,34 +1,41 @@
 ---
 name: websearch-image-understanding
-description: Web search, page fetching, and image understanding via MiniMax Token Plan APIs. Use when asked to "search the web", "look up", "find information online", "fetch a URL", "read a web page", "analyze an image", "describe this image", or "understand what's in this picture".
+description: Web search and image understanding via MiniMax Token Plan APIs. Use when asked to "search the web", "look up", "find information online", "analyze an image", "describe this image", or "understand what's in this picture".
 ---
 
 # websearch-image-understanding
 
-Token-efficient web search, page fetching, and image understanding via MiniMax Token Plan APIs.
+Token-efficient web search and image understanding via MiniMax Token Plan APIs.
 
 **Features:**
 - Uses pi's built-in MiniMax authentication automatically (no setup required)
 - Supports custom API key configuration via `/set-minimax-key` command
-- Provides `web_search`, `web_fetch`, and `image_understanding` tools
-- SSRF protection — blocks requests to private/loopback addresses
-- **Smart content negotiation** — detects Markdown, plain text, and HTML
-- **HTML → Markdown** conversion via Readability + Turndown + GFM
-- **Output modes** — auto (inline ≤15K chars), inline, or file
-- Large responses are automatically saved to temp files for later reading
+- Provides `web_search` and `image_understanding` tools
+- **No direct HTTP fetching** — for `web_fetch` / `batch_web_fetch` install `pi-smart-fetch`
 
 ---
 
 ## Quick Start (No Setup!)
 
-If you're using a pi with MiniMax integration, the API key is automatically configured.
+If you're using pi with the MiniMax provider, the API key is automatically configured.
 
 Try it:
 ```
 search "latest AI news"
-fetch https://docs.python.org/3/whatsnew/3.13.html
 describe this image: ./screenshot.png
 ```
+
+---
+
+## Related package: `pi-smart-fetch`
+
+This extension deliberately does **not** ship a `web_fetch` tool. For page fetching — including bot-resistant fetching of Cloudflare-protected sites, site-specific extractors (YouTube, Reddit, X, GitHub, HN, Substack), and `batch_web_fetch` with per-item progress — install:
+
+```bash
+pi install npm:pi-smart-fetch
+```
+
+`pi-smart-fetch` uses `wreq-js` for browser-impersonated TLS and `defuddle` for content extraction, and is independently maintained at [Thinkscape/agent-smart-fetch](https://github.com/Thinkscape/agent-smart-fetch). The two packages compose cleanly: use `web_search` here to find URLs, then `web_fetch` from `pi-smart-fetch` to read them.
 
 ---
 
@@ -36,7 +43,7 @@ describe this image: ./screenshot.png
 
 ### `/set-minimax-key <api-key> [region]`
 
-Configure your own MiniMax API key (overrides pi's built-in key).
+Configure your own MiniMax API key (overrides the built-in key).
 
 ```bash
 # Global endpoint (default)
@@ -71,50 +78,18 @@ web_search({
 })
 ```
 
-### `web_fetch`
-
-Fetch and read content from any web page URL. Automatically converts HTML to clean Markdown.
-
-```
-web_fetch({
-  url: "https://docs.python.org/3/whatsnew/3.13.html"
-})
-
-// With all options
-web_fetch({
-  url: "https://example.com/api-docs",
-  output_mode: "auto",    // auto | inline | file
-  abs_links: true,        // absolutize relative links
-  timeout_ms: 30000       // request timeout
-})
-```
-
 **Parameters:**
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `url` | string | ✓ | HTTP(S) URL to fetch |
-| `output_mode` | `"auto"` \| `"inline"` \| `"file"` | `"auto"` | Output mode |
-| `abs_links` | boolean | `true` | Absolutize relative links |
-| `timeout_ms` | number | `30000` | Timeout in milliseconds |
+| `query` | string | ✓ | The search query |
+| `related` | boolean | `false` | Include related searches in the response |
 
-**Output Modes:**
-- **`auto`** — returns Markdown inline if ≤15,000 characters; otherwise writes to a temporary file
-- **`inline`** — always returns Markdown inline
-- **`file`** — always writes to a temporary file
-
-**Features:**
-- Smart content negotiation (HEAD, sniff, sibling .md detection)
-- Mozilla Readability for article extraction
-- Turndown with GitHub Flavored Markdown (GFM) support
-- Tables, strikethrough, and task lists preserved
-- Code blocks with language detection
-- Blocks dangerous URI schemes (javascript:, data:, file:)
-- SSRF protection — refuses private/loopback addresses
+**Returns:** A numbered list of results with title, URL, and snippet. If `related: true`, a "Related: …" line is appended with suggested follow-up queries.
 
 ### `image_understanding`
 
-Analyze images (URLs, local files, or base64).
+Analyze an image (URL, local file, or base64 data) and get an AI description.
 
 ```
 image_understanding({
@@ -128,6 +103,15 @@ image_understanding({
 })
 ```
 
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `image` | string | Image URL, local file path, or base64 data. The `@` prefix (MCP convention) is stripped automatically. |
+| `prompt` | string | Question or instruction about the image |
+
+**Local file support:** If `image` is not an `http://`, `https://`, or `data:` URL, it is treated as a path. Absolute paths are used as-is; relative paths resolve against the current working directory. Supported formats: JPEG, PNG, WebP (other formats are detected by extension and sent with the best-guess mime type).
+
 ---
 
 ## When to Use
@@ -136,7 +120,8 @@ image_understanding({
 - User shares an image and asks what it contains
 - User wants real-time web information
 - User asks "what's in this screenshot/photo"
-- User provides a URL to read or research
+
+For fetching the contents of a specific URL after searching, defer to `pi-smart-fetch`'s `web_fetch` tool.
 
 ---
 
@@ -147,14 +132,10 @@ image_understanding({
 - China: `https://api.minimaxi.com`
 
 **Key Priority:**
-1. User-configured key (`~/.config/minimax-support/creds.toml`)
-2. Pi built-in "MiniMax" authentication (global)
-3. Pi built-in "MiniMax (China)" authentication
+1. User-configured key (`~/.config/minimax-support/creds.toml`) — set via `/set-minimax-key`
+2. Pi built-in "MiniMax" authentication (global) — from `~/.pi/agent/auth.json`
+3. Pi built-in "MiniMax (China)" authentication — from `~/.pi/agent/auth.json`
 
-**Dependencies:**
-- `@mozilla/readability` — Article content extraction
-- `jsdom` — HTML DOM parsing
-- `turndown` — HTML → Markdown conversion
-- `turndown-plugin-gfm` — GitHub Flavored Markdown support
+**Dependencies:** None at runtime. The extension is pure Node built-ins (`fs`, `path`, `os`, `https`, `url`).
 
-The extension automatically handles authentication - no environment variables needed!
+The extension automatically handles authentication — no environment variables needed!
