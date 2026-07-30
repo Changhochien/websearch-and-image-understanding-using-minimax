@@ -1,16 +1,16 @@
 ---
-name: websearch-image-understanding
-description: Web search and image understanding via MiniMax Token Plan APIs. Use when asked to "search the web", "look up", "find information online", "analyze an image", "describe this image", or "understand what's in this picture".
+name: minimax-web-search
+description: Web search via the MiniMax Token Plan API. Use when asked to search the web, look up current facts, or find information online.
 ---
 
-# websearch-image-understanding
+# MiniMax Web Search
 
-Token-efficient web search and image understanding via MiniMax Token Plan APIs.
+Token-efficient web search via the MiniMax Token Plan API.
 
 **Features:**
 - Uses pi's built-in MiniMax authentication automatically (no setup required)
-- Supports custom API key configuration via `/set-minimax-key` command
-- Provides `web_search` and `image_understanding` tools
+- Supports custom API key configuration via `/set-minimax-key`
+- Provides the `web_search` tool
 - **No direct HTTP fetching** — for `web_fetch` / `batch_web_fetch` install `pi-smart-fetch`
 
 ---
@@ -22,8 +22,17 @@ If you're using pi with the MiniMax provider, the API key is automatically confi
 Try it:
 ```
 search "latest AI news"
-describe this image: ./screenshot.png
 ```
+
+## Native Image Input
+
+Models with image support accept images directly through pi, for example:
+
+```bash
+pi @screenshot.png "Describe this interface"
+```
+
+This package intentionally does not register a separate image-analysis tool, avoiding conflicts with pi's native multimodal input.
 
 ---
 
@@ -85,41 +94,12 @@ web_search({
 | `query` | string | ✓ | The search query |
 | `related` | boolean | `false` | Include related searches in the response |
 
-**Returns:** A numbered list of results with title, URL, and snippet. If `related: true`, a "Related: …" line is appended with suggested follow-up queries.
-
-### `image_understanding`
-
-Analyze an image (URL, local file, or base64 data) and get an AI description.
-
-```
-image_understanding({
-  image: "https://example.com/photo.jpg",
-  prompt: "What does this image show?"
-})
-
-image_understanding({
-  image: "./screenshot.png",
-  prompt: "Describe the UI elements"
-})
-```
-
-**Parameters:**
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `image` | string | Image URL, local file path, or base64 data. The `@` prefix (MCP convention) is stripped automatically. |
-| `prompt` | string | Question or instruction about the image |
-
-**Local file support:** If `image` is not an `http://`, `https://`, or `data:` URL, it is treated as a path. Absolute paths are used as-is; relative paths resolve against the current working directory. Supported formats: JPEG, PNG, WebP (other formats are detected by extension and sent with the best-guess mime type).
-
----
+**Returns:** A bounded numbered list of up to 10 results with title, URL, optional date, and snippet. If `related: true`, a "Related: …" line is appended with up to 10 suggested follow-up queries. Requests time out after 30 seconds and honor Pi cancellation.
 
 ## When to Use
 
-- User asks to "search for X", "look up", "find information online"
-- User shares an image and asks what it contains
+- User asks to "search for X", "look up", or "find information online"
 - User wants real-time web information
-- User asks "what's in this screenshot/photo"
 
 For fetching the contents of a specific URL after searching, defer to `pi-smart-fetch`'s `web_fetch` tool.
 
@@ -133,9 +113,11 @@ For fetching the contents of a specific URL after searching, defer to `pi-smart-
 
 **Key Priority:**
 1. User-configured key (`~/.config/minimax-support/creds.toml`) — set via `/set-minimax-key`
-2. Pi built-in "MiniMax" authentication (global) — from `~/.pi/agent/auth.json`
-3. Pi built-in "MiniMax (China)" authentication — from `~/.pi/agent/auth.json`
+2. Pi-resolved "MiniMax" authentication (global) — stored credentials or `MINIMAX_API_KEY`
+3. Pi-resolved "MiniMax CN" authentication — stored credentials or `MINIMAX_CN_API_KEY`
 
-**Dependencies:** None at runtime. The extension is pure Node built-ins (`fs`, `path`, `os`, `https`, `url`).
+Pi authentication is resolved through the Pi 0.83+ ModelRegistry API; the extension does not parse `auth.json` directly.
+
+**Dependencies:** Runtime `typebox`, the Pi-provided `@earendil-works/pi-coding-agent` peer, and Node built-ins.
 
 The extension automatically handles authentication — no environment variables needed!
