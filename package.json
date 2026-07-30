@@ -1,5 +1,5 @@
 {
-  "name": "websearch-image-understanding",
+  "name": "minimax-web-search",
   "version": "2.0.0",
   "description": "Web search via the MiniMax Token Plan API. For web_fetch and batch_web_fetch, install pi-smart-fetch separately.",
   "type": "module",

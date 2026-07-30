@@ -363,8 +363,9 @@ test("package metadata supports clean runtime installs and excludes development 
     encoding: "utf8",
   });
   assert.equal(child.status, 0, child.stderr);
-  const [{ files }] = JSON.parse(child.stdout);
-  const packed = files.map((file) => file.path);
+  const [packageSummary] = JSON.parse(child.stdout);
+  assert.equal(packageSummary.name, "minimax-web-search");
+  const packed = packageSummary.files.map((file) => file.path);
   assert.ok(packed.includes("extension/index.ts"));
   assert.ok(packed.includes("SKILL.md"));
   assert.ok(packed.includes("tsconfig.json"));
